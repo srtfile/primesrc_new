@@ -1,22 +1,4 @@
-# PrimeSrc Embed URLs
-# Add one URL or TMDB ID per line
-# Lines starting with # are ignored
+https://primesrc.me/embed/movie?tmdb=19995
 
-# Examples:
-# Full URL:
-# https://primesrc.me/embed/movie?tmdb=550
-
-# Just TMDB ID (will be converted to movie embed):
-# 550
-
-# TV shows (specify full URL):
-# https://primesrc.me/embed/tv?tmdb=1396&s=1&e=1
-
-# Add your URLs below:
-https://primesrc.me/embed/movie?tmdb=45050
-https://primesrc.me/embed/movie?tmdb=280
-https://primesrc.me/embed/movie?tmdb=254
-https://primesrc.me/embed/movie?tmdb=218
-https://primesrc.me/embed/movie?tmdb=1007757
 
 
