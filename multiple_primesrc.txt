@@ -14,5 +14,8 @@
 
 # Add your URLs below:
 https://primesrc.me/embed/movie?tmdb=45050
+https://primesrc.me/embed/movie?tmdb=280
+https://primesrc.me/embed/movie?tmdb=254
+https://primesrc.me/embed/movie?tmdb=218
 
 
