@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 primesrc_pipeline.py  –  Unified PrimeSrc pipeline
 ====================================================
@@ -7,7 +6,7 @@ Stage 1  (primesrcembed.py logic)
     Read multiple_primesrc.txt  →  fetch /api/v1/s for every tmdb embed URL
     →  collect all server option keys  →  write api_url_list.txt
 
-Stage 2  (extract_primesrc_urls.py logic  — copied verbatim and integrated)
+Stage 2  (extract_primesrc_urls.py logic)
     Read api_url_list.txt  →  send every /api/v1/l?key=… to FlareSolverr
     →  extract stream URL from the JSON response
     →  extract stream / embed link URL  →  write final_stream_urls.txt
@@ -405,29 +404,6 @@ def _check_flaresolverr_health(base_url: str) -> bool:
         return False
 
 
-def _direct_fetch_api_url(api_url: str, timeout: int = 20) -> Any:
-    import urllib.error
-    parsed   = urlparse(api_url)
-    referer  = f"{parsed.scheme}://{parsed.netloc}/embed/movie"
-    req = Request(
-        api_url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept":          "application/json, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer":         referer,
-            "Origin":          f"{parsed.scheme}://{parsed.netloc}",
-        },
-    )
-    with urlopen(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return json.loads(resp.read().decode(charset, errors="replace"))
-
-
 def _parse_flaresolverr_response(resp: dict[str, Any]) -> Any:
     solution  = resp.get("solution", {})
     body_html = solution.get("response", "")
@@ -448,8 +424,6 @@ async def _resolve_one_flaresolverr(
     index: int,
     total: int,
 ) -> dict[str, Any]:
-    import urllib.error
-
     loop  = asyncio.get_running_loop()
     label = f"[{index:>3}/{total}]"
 
@@ -459,51 +433,10 @@ async def _resolve_one_flaresolverr(
 
         for attempt in range(reloads + 1):
             if attempt:
-                await safe_print(f"{label} ↻ retry {attempt}/{reloads}")
+                await safe_print(f"{label} ↻ FlareSolverr retry {attempt}/{reloads}")
                 await asyncio.sleep(1.5)
 
-            # ── Step 1: direct urllib ──────────────────
-            try:
-                data = await loop.run_in_executor(
-                    None, lambda: _direct_fetch_api_url(api_url)
-                )
-                play_url = get_play_url(data)
-                if play_url:
-                    await safe_print(f"{label} ✓ (direct) {play_url}")
-                    return {
-                        "index":         index,
-                        "api_url":       api_url,
-                        "data":          data,
-                        "extracted_url": play_url,
-                        "method":        "direct",
-                    }
-                if isinstance(data, dict):
-                    for candidate_key in ("url", "link", "redirect", "location"):
-                        candidate = data.get(candidate_key, "")
-                        if isinstance(candidate, str) and candidate.startswith("http"):
-                            await safe_print(f"{label} ✓ (direct/redirect) {candidate}")
-                            return {
-                                "index":         index,
-                                "api_url":       api_url,
-                                "data":          data,
-                                "extracted_url": candidate,
-                                "method":        "direct",
-                            }
-                last_error = f"no play URL in direct response: {str(data)[:120]}"
-                await safe_print(f"{label} ✗ (direct) {last_error}")
-                continue
-
-            except urllib.error.HTTPError as exc:
-                if exc.code in (403, 429, 503):
-                    await safe_print(f"{label} ↷ direct blocked (HTTP {exc.code}), trying FlareSolverr…")
-                else:
-                    last_error = f"direct HTTP {exc.code}: {exc.reason}"
-                    await safe_print(f"{label} ✗ (direct) {last_error}")
-                    continue
-            except Exception as exc:
-                await safe_print(f"{label} ↷ direct failed ({exc}), trying FlareSolverr…")
-
-            # ── Step 2: FlareSolverr fallback ──────────────────────
+            # ── Route Everything Directly Through FlareSolverr ──────────────────────
             try:
                 fs_resp = await loop.run_in_executor(
                     None,
@@ -1254,3 +1187,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
