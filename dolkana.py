@@ -277,23 +277,9 @@ def stage1_fetch_api_keys(
 
 # ═══════════════════════════════════════════════════════════════
 # STAGE 2  –  api_url_list.txt → FlareSolverr → stream URLs
-#
-#  FlareSolverr is a proxy server that bypasses Cloudflare and
-#  similar anti-bot challenges.  It accepts a JSON POST to its
-#  /v1 endpoint and returns the fully-rendered page content.
-#
-#  Self-host locally or in CI with Docker:
-#    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
-#
-#  Set FLARESOLVERR_URL env var if your instance runs elsewhere.
-#  Default: http://localhost:8191
 # ═══════════════════════════════════════════════════════════════
 
 FLARESOLVERR_DEFAULT_URL = "http://localhost:8191"
-
-# Timeout FlareSolverr should use internally (ms) when solving a challenge.
-# The /api/v1/l?key=… endpoints don't need a challenge solve — they just
-# need the Cloudflare cookie already in the session — so 30 s is ample.
 FLARESOLVERR_MAX_TIMEOUT = 30_000  # ms
 
 _print_lock: asyncio.Lock | None = None
@@ -303,8 +289,6 @@ async def safe_print(*a: Any, **kw: Any) -> None:
     async with _print_lock:  # type: ignore[union-attr]
         print(*a, **kw)
 
-
-# ── JSON / URL helpers ──────────────────────────────────────────
 
 def extract_json(text: str) -> Any:
     text = (text or "").strip()
@@ -343,8 +327,6 @@ def get_play_url(data: Any) -> str | None:
     return None
 
 
-# ── FlareSolverr session management ────────────────────────────
-
 def _flaresolverr_url(args: argparse.Namespace) -> str:
     return (
         os.environ.get("FLARESOLVERR_URL")
@@ -354,7 +336,6 @@ def _flaresolverr_url(args: argparse.Namespace) -> str:
 
 
 def _fs_post(base_url: str, payload: dict[str, Any], http_timeout: int = 120) -> dict[str, Any]:
-    """Blocking POST to FlareSolverr /v1 endpoint (runs in executor)."""
     import urllib.error
     data = json.dumps(payload).encode("utf-8")
     req  = Request(
@@ -367,12 +348,9 @@ def _fs_post(base_url: str, payload: dict[str, Any], http_timeout: int = 120) ->
         with urlopen(req, timeout=http_timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
-        # FlareSolverr returns HTTP 500 with a JSON body describing the real error.
-        # Read and surface it instead of a misleading "cannot reach" message.
         try:
             body = exc.read().decode("utf-8", errors="replace")
             fs_resp = json.loads(body)
-            # Return it as a failed FlareSolverr response so callers can log properly.
             return {
                 "status": "error",
                 "message": fs_resp.get("message", body[:300]),
@@ -384,13 +362,11 @@ def _fs_post(base_url: str, payload: dict[str, Any], http_timeout: int = 120) ->
             ) from exc
     except urllib.error.URLError as exc:
         raise ConnectionError(
-            f"Cannot reach FlareSolverr at {base_url}/v1 — "
-            f"is it running?  ({exc})"
+            f"Cannot reach FlareSolverr at {base_url}/v1 — is it running?  ({exc})"
         ) from exc
 
 
 async def _fs_create_session(base_url: str, session_id: str) -> None:
-    """Create a persistent FlareSolverr session (reuses Cloudflare cookies)."""
     loop = asyncio.get_running_loop()
     resp = await loop.run_in_executor(
         None,
@@ -421,7 +397,6 @@ async def _fs_destroy_session(base_url: str, session_id: str) -> None:
 
 
 def _check_flaresolverr_health(base_url: str) -> bool:
-    """Return True if FlareSolverr /health responds OK."""
     try:
         with urlopen(f"{base_url}/health", timeout=5) as resp:
             body = json.loads(resp.read())
@@ -430,16 +405,8 @@ def _check_flaresolverr_health(base_url: str) -> bool:
         return False
 
 
-# ── Per-URL resolver via FlareSolverr ──────────────────────────
-
 def _direct_fetch_api_url(api_url: str, timeout: int = 20) -> Any:
-    """
-    Try to fetch a /api/v1/l?key=… URL directly with plain urllib.
-    Returns parsed JSON on success, raises on HTTP 403/429/5xx (Cloudflare block).
-    This avoids FlareSolverr entirely when the endpoint isn't behind a challenge.
-    """
     import urllib.error
-    # Use the embed page as referer so the site accepts the request
     parsed   = urlparse(api_url)
     referer  = f"{parsed.scheme}://{parsed.netloc}/embed/movie"
     req = Request(
@@ -462,11 +429,6 @@ def _direct_fetch_api_url(api_url: str, timeout: int = 20) -> Any:
 
 
 def _parse_flaresolverr_response(resp: dict[str, Any]) -> Any:
-    """
-    Extract and parse the JSON body from a successful FlareSolverr response.
-    FlareSolverr wraps bare-JSON responses in a minimal HTML skeleton;
-    this strips the HTML and returns the parsed JSON object.
-    """
     solution  = resp.get("solution", {})
     body_html = solution.get("response", "")
     body_text = body_html
@@ -486,19 +448,6 @@ async def _resolve_one_flaresolverr(
     index: int,
     total: int,
 ) -> dict[str, Any]:
-    """
-    Fetch one /api/v1/l?key=… URL and extract a play URL.
-
-    Strategy (in order):
-      1. Direct urllib fetch — works when the endpoint isn't behind a
-         Cloudflare JS challenge (no browser overhead, no 500 from FS).
-      2. FlareSolverr — fallback if the direct fetch is blocked (403/503).
-
-    FlareSolverr returning HTTP 500 on raw-JSON endpoints is a known
-    upstream bug: it tries to "solve" a page that has no challenge and
-    its internal browser chokes.  We avoid that by only calling FS when
-    the direct fetch actually fails with a Cloudflare-style block.
-    """
     import urllib.error
 
     loop  = asyncio.get_running_loop()
@@ -506,7 +455,6 @@ async def _resolve_one_flaresolverr(
 
     async with sem:
         await safe_print(f"{label} → {api_url}")
-
         last_error: str | None = None
 
         for attempt in range(reloads + 1):
@@ -514,7 +462,7 @@ async def _resolve_one_flaresolverr(
                 await safe_print(f"{label} ↻ retry {attempt}/{reloads}")
                 await asyncio.sleep(1.5)
 
-            # ── Step 1: direct urllib (fast path) ──────────────────
+            # ── Step 1: direct urllib ──────────────────
             try:
                 data = await loop.run_in_executor(
                     None, lambda: _direct_fetch_api_url(api_url)
@@ -543,22 +491,16 @@ async def _resolve_one_flaresolverr(
                             }
                 last_error = f"no play URL in direct response: {str(data)[:120]}"
                 await safe_print(f"{label} ✗ (direct) {last_error}")
-                # No point trying FlareSolverr — the data arrived fine, just no URL.
                 continue
 
             except urllib.error.HTTPError as exc:
                 if exc.code in (403, 429, 503):
-                    # Likely a Cloudflare block — fall through to FlareSolverr.
-                    await safe_print(
-                        f"{label} ↷ direct blocked (HTTP {exc.code}), trying FlareSolverr…"
-                    )
+                    await safe_print(f"{label} ↷ direct blocked (HTTP {exc.code}), trying FlareSolverr…")
                 else:
                     last_error = f"direct HTTP {exc.code}: {exc.reason}"
                     await safe_print(f"{label} ✗ (direct) {last_error}")
                     continue
-
             except Exception as exc:
-                # Network error on direct fetch — fall through to FlareSolverr.
                 await safe_print(f"{label} ↷ direct failed ({exc}), trying FlareSolverr…")
 
             # ── Step 2: FlareSolverr fallback ──────────────────────
@@ -576,8 +518,7 @@ async def _resolve_one_flaresolverr(
                 if fs_resp.get("status") != "ok":
                     last_error = (
                         f"FlareSolverr error: {fs_resp.get('message', '')}"
-                        + (f" (HTTP {fs_resp.get('_http_status')})"
-                           if "_http_status" in fs_resp else "")
+                        + (f" (HTTP {fs_resp.get('_http_status')})" if "_http_status" in fs_resp else "")
                     )
                     await safe_print(f"{label} ✗ (FS) {last_error}")
                     continue
@@ -646,8 +587,6 @@ async def _process_batch_fs(
     return await asyncio.gather(*tasks)
 
 
-# ── Stage 2 main runner ─────────────────────────────────────────
-
 async def stage2_extract_stream_urls(
     api_list_file: Path,
     stream_out_file: Path,
@@ -678,21 +617,17 @@ async def stage2_extract_stream_urls(
     log_info(f"Final retry passes  : {args.final_retries}")
     log_info(f"Solver timeout      : {timeout_ms} ms")
 
-    # ── Health check ────────────────────────────────────────────
     log_info("Checking FlareSolverr health…")
     if not _check_flaresolverr_health(base_url):
         log_err(
             f"FlareSolverr is not reachable at {base_url}\n"
             "  Start it with Docker:\n"
-            "    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest\n"
-            "  Or set FLARESOLVERR_URL to point at your instance."
+            "    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest"
         )
         raise ConnectionError("FlareSolverr not reachable")
     log_ok("FlareSolverr is healthy")
 
-    # ── Create shared session (reuses Cloudflare cookies across requests) ──
     await _fs_create_session(base_url, session_id)
-
     t_start = time.monotonic()
     results: list[dict[str, Any]] = []
 
@@ -708,7 +643,6 @@ async def stage2_extract_stream_urls(
                 f"Batch {batch_num}/{batch_total}",
             ))
 
-        # Final retry passes for still-failed URLs
         for attempt in range(1, args.final_retries + 1):
             failed = [
                 (item["index"], item["api_url"])
@@ -725,9 +659,7 @@ async def stage2_extract_stream_urls(
             )
             retry_by_index = {r["index"]: r for r in retry_results}
             results = [
-                retry_by_index.get(item["index"], item)
-                if not item.get("extracted_url")
-                else item
+                retry_by_index.get(item["index"], item) if not item.get("extracted_url") else item
                 for item in results
             ]
 
@@ -736,7 +668,6 @@ async def stage2_extract_stream_urls(
 
     results.sort(key=lambda r: r.get("index", 0))
 
-    # Write stream URLs to file
     lines: list[str] = []
     for item in results:
         if item.get("extracted_url"):
@@ -758,22 +689,16 @@ async def stage2_extract_stream_urls(
             log_err(f"FAILED : {item['api_url']}  ({item.get('error', 'no URL')})")
 
     log_info(f"Success : {len(ok)} / {len(results)}    Failed : {len(fails)}")
-
     return results
 
 
 # ═══════════════════════════════════════════════════════════════
-# SUMMARY — JSON + HTML report
+# TMDB TITLE LOOKUP
 # ═══════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════
-# TMDB TITLE LOOKUP  (no API key needed — uses public endpoint)
-# ═══════════════════════════════════════════════════════════════
-
-TMDB_API_KEY = "6fad3f86b8452ee232deb7977d7dcf58"   # optional: set your v3 key here for faster lookups
+TMDB_API_KEY = "6fad3f86b8452ee232deb7977d7dcf58"
 
 def _tmdb_request(path: str) -> dict:
-    """Make a TMDB API request. Uses API key if set."""
     base = "https://api.themoviedb.org/3"
     sep  = "&" if "?" in path else "?"
     url  = f"{base}{path}{sep}language=en-US"
@@ -792,19 +717,13 @@ def _tmdb_request(path: str) -> dict:
 
 
 def _fetch_tmdb_info(tmdb_id: str) -> tuple[str, str]:
-    """
-    Returns (title, imdb_id) for a given TMDB movie ID.
-    Hits /movie/{id} for title and /movie/{id}/external_ids for imdb_id.
-    Falls back to ("", None) on any error.
-    """
     title   = ""
     imdb_id = None
     try:
         data    = _tmdb_request(f"/movie/{tmdb_id}")
         title   = data.get("title") or data.get("original_title") or ""
-        imdb_id = data.get("imdb_id") or None   # already "tt..." format
+        imdb_id = data.get("imdb_id") or None
         if not imdb_id:
-            # fallback: external_ids endpoint
             ext     = _tmdb_request(f"/movie/{tmdb_id}/external_ids")
             imdb_id = ext.get("imdb_id") or None
     except Exception as exc:
@@ -817,7 +736,6 @@ def _fetch_tmdb_info(tmdb_id: str) -> tuple[str, str]:
 # ═══════════════════════════════════════════════════════════════
 
 def _to_gz_b64_json(pretty_path: Path, gz_path: Path) -> None:
-    """Read pretty JSON → gzip-compress → base64-encode → save as JSON wrapper."""
     raw   = pretty_path.read_bytes()
     gz    = gzip.compress(raw, compresslevel=9)
     b64   = base64.b64encode(gz).decode("ascii")
@@ -827,47 +745,31 @@ def _to_gz_b64_json(pretty_path: Path, gz_path: Path) -> None:
         "compressed":  b64,
     }
     gz_path.write_text(json.dumps(wrapper, ensure_ascii=False), encoding="utf-8")
-    log_ok(
-        f"Compressed JSON → {gz_path}  "
-        f"({len(raw):,} B → {len(gz):,} B gz → {len(b64):,} B b64)"
-    )
+    log_ok(f"Compressed JSON → {gz_path}  ({len(raw):,} B → {len(gz):,} B gz → {len(b64):,} B b64)")
 
 
 # ═══════════════════════════════════════════════════════════════
-# SUMMARY WRITER  (pretty JSON  +  gzip/base64 JSON)
+# SUMMARY WRITER
 # ═══════════════════════════════════════════════════════════════
 
 def _format_summary_json(records: list[dict[str, Any]]) -> str:
-    """
-    Serialise the summary list to JSON with a custom layout:
-      - Each record's header fields (serial, title, tmdb_id …) are on their own lines.
-      - Each host-N / url-N *pair* is kept on a single line:
-          "host-1": "dood.watch", "url-1": "https://…"
-    The result is valid JSON (readable by json.loads) even though it isn't
-    produced by the standard indent= formatter.
-    """
     import re as _re
 
     def _jv(v: Any) -> str:
-        """JSON-encode a scalar value."""
         return json.dumps(v, ensure_ascii=False)
 
     lines: list[str] = ["["]
     for rec_idx, rec in enumerate(records):
         lines.append("  {")
-        # Collect keys in order; separate header keys from host-N/url-N pairs
         header_keys = ["serial", "title", "tmdb_id", "imdb_id", "extracted_at"]
-        # Find how many source pairs exist
         n_sources = sum(1 for k in rec if _re.fullmatch(r"host-\d+", k))
 
         all_field_lines: list[str] = []
 
-        # Header fields
         for hk in header_keys:
             if hk in rec:
                 all_field_lines.append(f'    {_jv(hk)}: {_jv(rec[hk])}')
 
-        # Source pairs — host-N and url-N on the same line
         for n in range(1, n_sources + 1):
             hkey = f"host-{n}"
             ukey = f"url-{n}"
@@ -875,12 +777,11 @@ def _format_summary_json(records: list[dict[str, Any]]) -> str:
             url_part  = f'{_jv(ukey)}: {_jv(rec.get(ukey, ""))}'
             all_field_lines.append(f"    {host_part}, {url_part}")
 
-        # Join with commas; last field of last record has no trailing comma
         is_last_rec = rec_idx == len(records) - 1
         for fi, fl in enumerate(all_field_lines):
             is_last_field = fi == len(all_field_lines) - 1
             if is_last_field:
-                lines.append(fl)          # no comma after last field in object
+                lines.append(fl)
             else:
                 lines.append(fl + ",")
 
@@ -897,25 +798,21 @@ def _write_summary(
     stage1_options: list[ServerOption],
     stage2_results: list[dict[str, Any]],
     json_path: Path,
-    html_path: Path,  # kept for CLI compat — not used
+    html_path: Path,
 ) -> None:
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
 
-    # ── 1. group new sources by tmdb_id ──────────────────────────
     new_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    tmdb_to_main: dict[str, str] = {}
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
         if not stream_url:
             continue
-        qs   = dict(x.split("=", 1) for x in urlparse(opt.main_url).query.split("&") if "=" in x)
+        qs = dict(x.split("=", 1) for x in urlparse(opt.main_url).query.split("&") if "=" in x)
         tmdb = qs.get("tmdb", "")
         if not tmdb:
             continue
         new_groups[tmdb].append({"host": urlparse(stream_url).netloc, "url": stream_url})
-        tmdb_to_main.setdefault(tmdb, opt.main_url)
 
-    # ── 2. load existing pretty JSON (if any) ────────────────────
     existing: list[dict[str, Any]] = []
     if json_path.exists():
         try:
@@ -927,13 +824,9 @@ def _write_summary(
             log_warn(f"Could not load existing JSON ({exc}) — starting fresh")
             existing = []
 
-    # ── 3. upsert: merge new into existing keyed by tmdb_id ──────
-    # One entry per movie; sources stored internally as a list,
-    # deduplicated by url.
     index: dict[int, dict[str, Any]] = {}
     for e in existing:
         tmdb_int = e["tmdb_id"]
-        # Reconstruct internal sources list from flat host-N / url-N keys
         sources: list[dict[str, str]] = []
         n = 1
         while f"host-{n}" in e:
@@ -944,7 +837,7 @@ def _write_summary(
             "imdb_id":      e.get("imdb_id"),
             "title":        e.get("title", ""),
             "extracted_at": e["extracted_at"],
-            "_sources":     sources,   # internal list, not written to JSON
+            "_sources":     sources,
         }
 
     extracted_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -977,12 +870,10 @@ def _write_summary(
             }
             log_ok(f"  tmdb={tmdb_int} — '{title}'  sources: {len(new_sources)}")
 
-    # ── 4. sort by tmdb_id, assign serial numbers ─────────────────
     sorted_entries = sorted(index.values(), key=lambda x: x["tmdb_id"])
     for i, entry in enumerate(sorted_entries, 1):
         entry["serial"] = i
 
-    # ── 5. build flat output: host-1/url-1, host-2/url-2, … ───────
     output: list[dict[str, Any]] = []
     for e in sorted_entries:
         row: dict[str, Any] = {
@@ -997,25 +888,20 @@ def _write_summary(
             row[f"url-{n}"]  = src["url"]
         output.append(row)
 
-    # ── 6. write pretty JSON  (host-N and url-N on the same line) ──
     json_path.write_text(_format_summary_json(output), encoding="utf-8")
     log_ok(f"Pretty JSON → {json_path}")
-    total_sources = sum(
-        sum(1 for k in row if k.startswith("url-")) for row in output
-    )
+    total_sources = sum(sum(1 for k in row if k.startswith("url-")) for row in output)
     log_info(f"Movies : {len(output)}   Sources : {total_sources}")
 
-    # ── 7. write gzip/base64 JSON alongside the pretty one ───────
     gz_path = json_path.with_suffix("").with_suffix(".gz.json")
     _to_gz_b64_json(json_path, gz_path)
 
 
 # ═══════════════════════════════════════════════════════════════
-# GITHUB SYNC  –  fetch → merge → split → push
+# STAGE 3  –  GITHUB SYNC
 # ═══════════════════════════════════════════════════════════════
 
 def _gh_filename(n: int) -> str:
-    """Return the filename for the nth summary file (1-based)."""
     if n == 1:
         return f"{GITHUB_BASE_FILENAME}.json"
     return f"{GITHUB_BASE_FILENAME}-{n}.json"
@@ -1028,11 +914,6 @@ def _gh_api_request(
     payload: dict[str, Any] | None = None,
     timeout: int = 30,
 ) -> dict[str, Any]:
-    """
-    Make an authenticated GitHub API request.
-    path: relative to GITHUB_API_ROOT, e.g. '/repos/owner/repo/contents/file.json'
-    Returns the parsed JSON response.
-    """
     import urllib.error
     url  = GITHUB_API_ROOT + path
     data = json.dumps(payload).encode("utf-8") if payload else None
@@ -1054,9 +935,7 @@ def _gh_api_request(
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"GitHub API {method} {path} → HTTP {exc.code}: {body[:400]}"
-        ) from exc
+        raise RuntimeError(f"GitHub API {method} {path} → HTTP {exc.code}: {body[:400]}") from exc
 
 
 def _gh_get_file(
@@ -1065,12 +944,6 @@ def _gh_get_file(
     path: str,
     branch: str,
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """
-    Fetch one pipeline_summary*.json file from GitHub.
-    Returns (records, sha) where sha is None when the file doesn't exist yet.
-    records is the parsed JSON array (empty list if file missing).
-    """
-    import urllib.error, urllib.request
     api_path = f"/repos/{repo}/contents/{path}?ref={branch}"
     try:
         meta = _gh_api_request("GET", api_path, token)
@@ -1079,7 +952,6 @@ def _gh_get_file(
             return [], None
         raise
 
-    # GitHub returns file content as base64 in meta['content']
     raw_b64 = meta.get("content", "").replace("\n", "")
     sha     = meta.get("sha")
     if not raw_b64:
@@ -1105,10 +977,6 @@ def _gh_push_file(
     sha: str | None,
     commit_msg: str,
 ) -> None:
-    """
-    Create or update a file in the GitHub repo via the Contents API.
-    sha must be provided when updating an existing file; None for new files.
-    """
     payload: dict[str, Any] = {
         "message": commit_msg,
         "content": base64.b64encode(content_bytes).decode("ascii"),
@@ -1128,12 +996,6 @@ def _gh_fetch_all_summary_files(
     repo: str,
     branch: str,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str | None]]]:
-    """
-    Fetch every pipeline_summary*.json from the repo (1, 2, 3, …) until one
-    is missing.  Returns:
-      - all_records : merged list of all records across all files
-      - file_meta   : [(filename, sha_or_None), …]  in order
-    """
     all_records: list[dict[str, Any]] = []
     file_meta:   list[tuple[str, str | None]] = []
 
@@ -1143,37 +1005,27 @@ def _gh_fetch_all_summary_files(
         file_meta.append((fname, sha))
         all_records.extend(records)
         if sha is None:
-            # File doesn't exist yet — no more files to check
             break
 
     return all_records, file_meta
 
 
-def _gh_split_records(
-    records: list[dict[str, Any]],
-) -> list[bytes]:
-    """
-    Serialize records into one or more JSON byte-strings, each ≤ GITHUB_FILE_SIZE_LIMIT.
-    Returns a list of encoded file contents in order.
-    Each chunk is a valid JSON array.
-    """
+def _gh_split_records(records: list[dict[str, Any]]) -> list[bytes]:
     chunks:       list[bytes] = []
     current:      list[dict[str, Any]] = []
-    current_size: int = 2   # "[\n" + "]"
+    current_size: int = 2
 
     for rec in records:
-        # Serialize this record alone to estimate its size
         rec_json = _format_summary_json([rec]).encode("utf-8")
-        rec_size = len(rec_json) - 4  # subtract "[\n" prefix + "]\n" suffix
+        rec_size = len(rec_json) - 4
 
         if current and current_size + rec_size + 2 > GITHUB_FILE_SIZE_LIMIT:
-            # Flush current chunk
             chunks.append(_format_summary_json(current).encode("utf-8"))
             current      = []
             current_size = 2
 
         current.append(rec)
-        current_size += rec_size + 2   # +2 for comma + newline between records
+        current_size += rec_size + 2
 
     if current:
         chunks.append(_format_summary_json(current).encode("utf-8"))
@@ -1182,31 +1034,19 @@ def _gh_split_records(
 
 
 def github_sync_summary(
-    stage1_options: list["ServerOption"],
+    stage1_options: list[ServerOption],
     stage2_results: list[dict[str, Any]],
     local_json_path: Path,
     token: str,
     repo: str,
     branch: str,
 ) -> None:
-    """
-    Full GitHub sync for the pipeline summary:
-      1. Fetch all existing pipeline_summary*.json from GitHub
-      2. Merge new results in (upsert by tmdb_id, deduplicate sources)
-      3. Split merged records across files respecting GITHUB_FILE_SIZE_LIMIT
-      4. Push only changed/new files back to GitHub
-      5. Write the first chunk also to local_json_path for the artifact upload
-    """
     log_head("STAGE 3  –  GitHub sync  →  " + repo)
 
-    if not token:
-        log_warn("GH_TOKEN not set — skipping GitHub sync")
-        return
-    if not repo:
-        log_warn("GH_REPO not set — skipping GitHub sync")
+    if not token or not repo:
+        log_warn("GitHub Sync variables incomplete — skipping remote push.")
         return
 
-    # ── 1. Fetch all existing files ─────────────────────────────
     log_info(f"Fetching existing summary files from {repo} (branch: {branch})…")
     try:
         remote_records, file_meta = _gh_fetch_all_summary_files(token, repo, branch)
@@ -1216,9 +1056,7 @@ def github_sync_summary(
 
     log_info(f"Remote total: {len(remote_records)} entries across {len(file_meta)} file(s)")
 
-    # ── 2. Build upsert index from remote ───────────────────────
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
-
     new_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
@@ -1230,7 +1068,6 @@ def github_sync_summary(
             continue
         new_groups[tmdb].append({"host": urlparse(stream_url).netloc, "url": stream_url})
 
-    # Build index from remote
     index: dict[int, dict[str, Any]] = {}
     for e in remote_records:
         tmdb_int = int(e.get("tmdb_id", 0))
@@ -1278,12 +1115,10 @@ def github_sync_summary(
             }
             log_ok(f"  tmdb={tmdb_int} — '{title}'  sources: {len(new_sources)}")
 
-    # ── 3. Sort + assign serials ─────────────────────────────────
     sorted_entries = sorted(index.values(), key=lambda x: x["tmdb_id"])
     for i, entry in enumerate(sorted_entries, 1):
         entry["serial"] = i
 
-    # Build flat output rows
     output: list[dict[str, Any]] = []
     for e in sorted_entries:
         row: dict[str, Any] = {
@@ -1301,18 +1136,14 @@ def github_sync_summary(
     total_sources = sum(sum(1 for k in r if k.startswith("url-")) for r in output)
     log_info(f"Merged total: {len(output)} movies, {total_sources} sources")
 
-    # ── 4. Split into chunks ≤ GITHUB_FILE_SIZE_LIMIT ───────────
     chunks = _gh_split_records(output)
     log_info(f"Split into {len(chunks)} file(s) ({GITHUB_FILE_SIZE_LIMIT // 1024 // 1024} MB limit each)")
 
-    # ── 5. Write local copy of chunk 1 ──────────────────────────
     local_json_path.write_bytes(chunks[0])
     log_ok(f"Local JSON → {local_json_path}  ({len(chunks[0]):,} B)")
     gz_path = local_json_path.with_suffix("").with_suffix(".gz.json")
     _to_gz_b64_json(local_json_path, gz_path)
 
-    # ── 6. Push to GitHub ────────────────────────────────────────
-    # Extend file_meta if we now have more chunks than before
     while len(file_meta) < len(chunks):
         n = len(file_meta) + 1
         file_meta.append((_gh_filename(n), None))
@@ -1320,18 +1151,7 @@ def github_sync_summary(
     pushed = 0
     for i, chunk_bytes in enumerate(chunks):
         fname, sha = file_meta[i]
-
-        # Skip push if content identical to what's already there
-        # (saves a commit when nothing changed in a file)
-        if sha is not None and remote_records:
-            # We can't cheaply compare — always push when we have new data
-            pass
-
-        commit_msg = (
-            f"Update {fname} via pipeline [{extracted_at}]"
-            if sha else
-            f"Create {fname} via pipeline [{extracted_at}]"
-        )
+        commit_msg = f"Update {fname} via pipeline [{extracted_at}]" if sha else f"Create {fname} via pipeline [{extracted_at}]"
         try:
             _gh_push_file(token, repo, fname, branch, chunk_bytes, sha, commit_msg)
             pushed += 1
@@ -1342,54 +1162,28 @@ def github_sync_summary(
 
 
 # ═══════════════════════════════════════════════════════════════
-# CLI
+# CLI ENTRYPOINT
 # ═══════════════════════════════════════════════════════════════
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="PrimeSrc unified pipeline: embed URLs → API keys → stream URLs"
-    )
-    # Paths
+    p = argparse.ArgumentParser(description="PrimeSrc unified pipeline: embed URLs → API keys → stream URLs")
     p.add_argument("--input",       type=Path, default=DEFAULT_INPUT_FILE)
     p.add_argument("--api-list",    type=Path, default=DEFAULT_API_LIST)
     p.add_argument("--output",      type=Path, default=DEFAULT_STREAM_OUT)
     p.add_argument("--json-out",    type=Path, default=DEFAULT_JSON_SUMMARY)
     p.add_argument("--html-out",    type=Path, default=DEFAULT_HTML_OUT)
-    # Pipeline control
-    p.add_argument("--skip-stage1", action="store_true",
-                   help="Skip Stage 1; use existing api_url_list.txt")
-    p.add_argument("--skip-stage2", action="store_true",
-                   help="Skip Stage 2; only collect keys, no FlareSolverr")
+    p.add_argument("--skip-stage1", action="store_true", help="Skip Stage 1; use existing api_url_list.txt")
+    p.add_argument("--skip-stage2", action="store_true", help="Skip Stage 2; only collect keys, no FlareSolverr")
     p.add_argument("--type",        choices=("movie", "tv"), default="movie")
-    # FlareSolverr / Stage 2
-    p.add_argument("--flaresolverr-url",
-                   default=None,
-                   dest="flaresolverr_url",
-                   help=(
-                       "FlareSolverr base URL "
-                       f"(default: {FLARESOLVERR_DEFAULT_URL} or $FLARESOLVERR_URL env var)"
-                   ))
-    p.add_argument("--fs-timeout",   type=int, default=FLARESOLVERR_MAX_TIMEOUT,
-                   dest="fs_timeout_ms",
-                   help="Max timeout FlareSolverr will wait per request (ms, default 30000)")
-    p.add_argument("--batch-size",   type=int, default=STAGE2_BATCH_SIZE,
-                   dest="batch_size",
-                   help="Concurrent FlareSolverr requests (default 5)")
-    p.add_argument("--reloads",      type=int, default=STAGE2_RELOADS,
-                   help="Retry attempts per failed URL (default 2)")
-    p.add_argument("--final-retries", type=int, default=STAGE2_FINAL_RETRIES,
-                   dest="final_retries",
-                   help="Extra full retry passes for still-failed keys (default 1)")
-    # GitHub sync
-    p.add_argument("--no-github-sync", action="store_true", default=False,
-                   dest="no_github_sync",
-                   help="Skip GitHub sync (Stage 3); results stay local only")
-    p.add_argument("--gh-token",   default=None, dest="gh_token",
-                   help="GitHub personal access token (default: $GH_TOKEN env var)")
-    p.add_argument("--gh-repo",    default=None, dest="gh_repo",
-                   help="GitHub repo owner/name (default: $GH_REPO env var)")
-    p.add_argument("--gh-branch",  default=None, dest="gh_branch",
-                   help="GitHub branch (default: $GH_BRANCH or 'main')")
+    p.add_argument("--flaresolverr-url", default=None, dest="flaresolverr_url", help="FlareSolverr URL")
+    p.add_argument("--fs-timeout",   type=int, default=FLARESOLVERR_MAX_TIMEOUT, dest="fs_timeout_ms", help="Solver timeout (ms)")
+    p.add_argument("--batch-size",   type=int, default=STAGE2_BATCH_SIZE, dest="batch_size", help="Batch process sizing")
+    p.add_argument("--reloads",      type=int, default=STAGE2_RELOADS, help="Retry attempts per URL")
+    p.add_argument("--final-retries", type=int, default=STAGE2_FINAL_RETRIES, dest="final_retries", help="Extra fallback cycles")
+    p.add_argument("--no-github-sync", action="store_true", default=False, dest="no_github_sync")
+    p.add_argument("--gh-token",   default=None, dest="gh_token")
+    p.add_argument("--gh-repo",    default=None, dest="gh_repo")
+    p.add_argument("--gh-branch",  default=None, dest="gh_branch")
     return p.parse_args(argv)
 
 
@@ -1402,7 +1196,6 @@ async def _run(args: argparse.Namespace) -> int:
     stage1_options: list[ServerOption] = []
     stage2_results: list[dict[str, Any]] = []
 
-    # Stage 1
     if args.skip_stage1:
         log_info("Stage 1 skipped — using existing api_url_list.txt")
     else:
@@ -1411,7 +1204,6 @@ async def _run(args: argparse.Namespace) -> int:
             return 1
         stage1_options = stage1_fetch_api_keys(args.input, args.api_list, args.type)
 
-    # Stage 2
     if args.skip_stage2:
         log_info("Stage 2 skipped.")
     else:
@@ -1419,17 +1211,13 @@ async def _run(args: argparse.Namespace) -> int:
             log_err(f"API list not found: {args.api_list}")
             return 1
         try:
-            stage2_results = await stage2_extract_stream_urls(
-                args.api_list, args.output, args
-            )
-        except ImportError:
-            log_err("FlareSolverr unreachable — is Docker running?  See --flaresolverr-url")
+            stage2_results = await stage2_extract_stream_urls(args.api_list, args.output, args)
+        except ConnectionError:
+            log_err("FlareSolverr unreachable – verification failed.")
             return 2
 
-    # Summary + GitHub sync
     if stage1_options or stage2_results:
         if not stage1_options and args.api_list.exists():
-            # Reconstruct stubs when stage1 was skipped
             for line in args.api_list.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -1437,29 +1225,21 @@ async def _run(args: argparse.Namespace) -> int:
                 key = line.split("key=")[-1] if "key=" in line else ""
                 stage1_options.append(ServerOption("", key, line, ""))
 
-        # Resolve GitHub credentials from args → env → defaults
         gh_token  = args.gh_token  or os.environ.get("GH_TOKEN", "")
         gh_repo   = args.gh_repo   or os.environ.get("GH_REPO",  "")
         gh_branch = args.gh_branch or os.environ.get("GH_BRANCH", "main")
 
         if not args.no_github_sync and gh_token and gh_repo:
-            # Stage 3: fetch remote, merge, split, push — also writes local json
-            github_sync_summary(
-                stage1_options, stage2_results,
-                args.json_out,
-                gh_token, gh_repo, gh_branch,
-            )
+            github_sync_summary(stage1_options, stage2_results, args.json_out, gh_token, gh_repo, gh_branch)
         else:
             if not args.no_github_sync and not gh_token:
-                log_warn("GH_TOKEN not set — GitHub sync skipped; writing locally only")
-            # Fallback: local-only write (original behaviour)
+                log_warn("GH_TOKEN not set — writing locally only")
             _write_summary(stage1_options, stage2_results, args.json_out, args.html_out)
 
     log_head("DONE")
     if not args.skip_stage2 and stage2_results:
         ok = sum(1 for r in stage2_results if r.get("extracted_url"))
         log_ok(f"Stream URLs extracted : {ok} / {len(stage2_results)}")
-        log_ok(f"Results written to    : {args.output}")
     return 0
 
 
