@@ -1,0 +1,150 @@
+name: PrimeSrc Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_stage1:
+        description: 'Skip Stage 1 (use existing api_url_list.txt)'
+        required: false
+        type: boolean
+        default: false
+      skip_stage2:
+        description: 'Skip Stage 2 (only collect keys, no FlareSolverr)'
+        required: false
+        type: boolean
+        default: false
+      media_type:
+        description: 'Media type (movie or tv)'
+        required: false
+        type: choice
+        options:
+          - movie
+          - tv
+        default: movie
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - 'dolkana.py'
+      - '.github/workflows/primesrc-pipeline.yml'
+      - 'multiple_primesrc.txt'
+
+jobs:
+  extract-urls:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── FlareSolverr ──────────────────────────────────────────────
+      # Pulls the official image and starts it on port 8191.
+      # No Cloudflare challenge is expected on /api/v1/l — FlareSolverr
+      # just provides a fresh browser session so the site doesn't block
+      # the plain HTTP request.
+      - name: Start FlareSolverr
+        run: |
+          docker pull ghcr.io/flaresolverr/flaresolverr:latest
+          docker run -d \
+            --name flaresolverr \
+            -p 8191:8191 \
+            -e LOG_LEVEL=info \
+            ghcr.io/flaresolverr/flaresolverr:latest
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr health endpoint..."
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s http://localhost:8191/health | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || true)
+            if [ "$STATUS" = "ok" ]; then
+              echo "FlareSolverr is ready (attempt $i)"
+              break
+            fi
+            echo "  attempt $i — not ready yet, sleeping 2s..."
+            sleep 2
+          done
+          # Final verification
+          curl -sf http://localhost:8191/health || (echo "FlareSolverr failed to start" && exit 1)
+
+      # ── Python (no extra deps — stdlib only) ─────────────────────
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # No third-party packages needed
+
+      - name: Create input file if not exists
+        run: |
+          if [ ! -f "multiple_primesrc.txt" ]; then
+            echo "# Add your PrimeSrc embed URLs here, one per line" > multiple_primesrc.txt
+            echo "# Example: https://primesrc.me/embed/movie?tmdb=12345" >> multiple_primesrc.txt
+          fi
+
+      # ── Run the pipeline ─────────────────────────────────────────
+      - name: Run PrimeSrc Pipeline
+        run: |
+          CMD="python dolkana.py"
+
+          if [ "${{ github.event.inputs.skip_stage1 }}" = "true" ]; then
+            CMD="$CMD --skip-stage1"
+          fi
+
+          if [ "${{ github.event.inputs.skip_stage2 }}" = "true" ]; then
+            CMD="$CMD --skip-stage2"
+          fi
+
+          if [ -n "${{ github.event.inputs.media_type }}" ]; then
+            CMD="$CMD --type ${{ github.event.inputs.media_type }}"
+          fi
+
+          echo "Running: $CMD"
+          $CMD
+        env:
+          FLARESOLVERR_URL: http://localhost:8191
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: srtfile/movie-data
+          GH_BRANCH: main
+        continue-on-error: true
+
+      # ── Collect FlareSolverr logs on failure ─────────────────────
+      - name: FlareSolverr logs (on failure)
+        if: failure()
+        run: docker logs flaresolverr || true
+
+      # ── Artifacts ────────────────────────────────────────────────
+      - name: Upload API URL list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-url-list
+          path: api_url_list.txt
+          if-no-files-found: ignore
+
+      - name: Upload stream URLs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-stream-urls
+          path: final_stream_urls.txt
+          if-no-files-found: ignore
+
+      - name: Upload JSON summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-summary
+          path: |
+            pipeline_summary.json
+            pipeline_summary.gz.json
+          if-no-files-found: ignore
+
+      # ── GitHub sync is handled inside dolkana.py (Stage 3) ──────
+      # The script calls the GitHub Contents API directly to push
+      # pipeline_summary.json (and -2, -3 … if > 20 MB) to srtfile/movie-data.
+      # No git push needed here.
