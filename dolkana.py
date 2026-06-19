@@ -471,6 +471,8 @@ async def _resolve_one_flaresolverr(
 ) -> dict[str, Any]:
     loop  = asyncio.get_running_loop()
     label = f"[{index:>3}/{total}]"
+    # Create a unique session per request to avoid state collision
+    unique_session = f"{session_id}_{index}"
 
     async with sem:
         await safe_print(f"{label} → {api_url}")
@@ -492,7 +494,7 @@ async def _resolve_one_flaresolverr(
             try:
                 fs_resp = await loop.run_in_executor(
                     None,
-                    lambda url=api_url, base=base_url, timeout=timeout_ms, session=session_id: _fs_post(base, {
+                    lambda url=api_url, base=base_url, timeout=timeout_ms, session=unique_session: _fs_post(base, {
                         "cmd":        "request.get",
                         "url":        url,
                         "maxTimeout": timeout,
