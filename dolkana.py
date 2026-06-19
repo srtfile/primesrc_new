@@ -808,7 +808,7 @@ def _write_summary(
 ) -> None:
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
 
-    new_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    new_groups_raw: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
         if not stream_url:
@@ -817,7 +817,12 @@ def _write_summary(
         tmdb = qs.get("tmdb", "")
         if not tmdb:
             continue
-        new_groups[tmdb].append({"host": urlparse(stream_url).netloc, "url": stream_url})
+        # Deduplicate within this run by URL — same stream URL must appear once per tmdb
+        if stream_url not in new_groups_raw[tmdb]:
+            new_groups_raw[tmdb][stream_url] = {"host": urlparse(stream_url).netloc, "url": stream_url}
+    new_groups: dict[str, list[dict[str, Any]]] = {
+        tmdb: list(url_map.values()) for tmdb, url_map in new_groups_raw.items()
+    }
 
     existing: list[dict[str, Any]] = []
     if json_path.exists():
@@ -1121,7 +1126,7 @@ def github_sync_summary(
     log_info(f"Remote total: {len(remote_records)} entries across {len(file_meta)} file(s)")
 
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
-    new_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    new_groups_raw: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
         if not stream_url:
@@ -1130,7 +1135,12 @@ def github_sync_summary(
         tmdb = qs.get("tmdb", "")
         if not tmdb:
             continue
-        new_groups[tmdb].append({"host": urlparse(stream_url).netloc, "url": stream_url})
+        # Deduplicate within this run by URL — same stream URL must appear once per tmdb
+        if stream_url not in new_groups_raw[tmdb]:
+            new_groups_raw[tmdb][stream_url] = {"host": urlparse(stream_url).netloc, "url": stream_url}
+    new_groups: dict[str, list[dict[str, Any]]] = {
+        tmdb: list(url_map.values()) for tmdb, url_map in new_groups_raw.items()
+    }
 
     index: dict[int, dict[str, Any]] = {}
     for e in remote_records:
