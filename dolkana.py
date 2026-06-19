@@ -87,6 +87,10 @@ GITHUB_FILE_SIZE_LIMIT = 20 * 1024 * 1024   # 20 MB
 # Base filename (without extension) used for the summary files.
 GITHUB_BASE_FILENAME   = "pipeline_summary"
 
+# Remote filename (and local cap) for the cumulative error/warning log.
+ERROR_LOG_GH_FILENAME  = "errorsfaced.txt"
+ERROR_LOG_GH_SIZE_LIMIT = 5 * 1024 * 1024   # 5 MB — trim oldest entries past this
+
 # GitHub API root
 GITHUB_API_ROOT        = "https://api.github.com"
 
@@ -127,20 +131,26 @@ def log_err(msg: str)  -> None:
     _record_log_entry("ERR", msg)
 def log_head(msg: str) -> None: print(_c(f"\n{'='*60}\n{msg}\n{'='*60}", _BOLD))
 
-def write_error_log(path: Path) -> None:
-    """Append everything collected in _ERROR_LOG_ENTRIES to a local file."""
+def _format_error_log_block() -> str:
+    """Build this run's timestamped WARN/ERR block. Empty string if nothing to log."""
     if not _ERROR_LOG_ENTRIES:
+        return ""
+    header = (
+        f"\n{'='*70}\n"
+        f"Pipeline run finished: {datetime.now(timezone.utc).isoformat()}\n"
+        f"Total warnings/errors: {len(_ERROR_LOG_ENTRIES)}\n"
+        f"{'='*70}\n"
+    )
+    return header + "\n".join(_ERROR_LOG_ENTRIES) + "\n"
+
+def write_error_log(path: Path) -> None:
+    """Append this run's collected entries to a local file (survives only on the runner's disk)."""
+    block = _format_error_log_block()
+    if not block:
         return
     try:
-        header = (
-            f"\n{'='*70}\n"
-            f"Pipeline run finished: {datetime.now(timezone.utc).isoformat()}\n"
-            f"Total warnings/errors: {len(_ERROR_LOG_ENTRIES)}\n"
-            f"{'='*70}\n"
-        )
         with open(path, "a", encoding="utf-8") as f:
-            f.write(header)
-            f.write("\n".join(_ERROR_LOG_ENTRIES) + "\n")
+            f.write(block)
         log_ok(f"Error/warning log appended → {path}  ({len(_ERROR_LOG_ENTRIES)} entries)")
     except Exception as exc:
         print(_c(f"[ERR]   Could not write error log to {path}: {exc}", _RED))
@@ -987,6 +997,64 @@ def _gh_push_file(
     log_ok(f"  GitHub → {path} {action} ({len(content_bytes):,} B)")
 
 
+def _gh_get_text_file(
+    token: str,
+    repo: str,
+    path: str,
+    branch: str,
+) -> tuple[str, str | None]:
+    """Like _gh_get_file but for plain text (not JSON) — returns (text, sha)."""
+    api_path = f"/repos/{repo}/contents/{path}?ref={branch}"
+    try:
+        meta = _gh_api_request("GET", api_path, token)
+    except RuntimeError as exc:
+        if "HTTP 404" in str(exc):
+            return "", None
+        raise
+
+    raw_b64 = meta.get("content", "").replace("\n", "")
+    sha     = meta.get("sha")
+    if not raw_b64:
+        return "", sha
+    try:
+        text = base64.b64decode(raw_b64).decode("utf-8", errors="replace")
+        return text, sha
+    except Exception as exc:
+        log_warn(f"  Could not decode {path} from GitHub ({exc}) — treating as empty")
+        return "", sha
+
+
+def github_sync_error_log(
+    token: str,
+    repo: str,
+    branch: str,
+    filename: str = ERROR_LOG_GH_FILENAME,
+) -> None:
+    """
+    Append this run's WARN/ERR block onto errorsfaced.txt *inside the GitHub
+    repo* (not just the ephemeral runner disk), so it survives across runs
+    and doesn't depend on artifact retention windows.
+    """
+    block = _format_error_log_block()
+    if not block:
+        return  # nothing went wrong this run — don't touch the remote file
+
+    existing_text, sha = _gh_get_text_file(token, repo, filename, branch)
+    merged = existing_text + block
+
+    merged_bytes = merged.encode("utf-8")
+    if len(merged_bytes) > ERROR_LOG_GH_SIZE_LIMIT:
+        merged_bytes = merged_bytes[-ERROR_LOG_GH_SIZE_LIMIT:]
+        merged = "[... older entries trimmed ...]\n" + merged_bytes.decode("utf-8", errors="ignore")
+        merged_bytes = merged.encode("utf-8")
+
+    commit_msg = f"Update {filename} via pipeline [{datetime.now(timezone.utc).isoformat()}]"
+    try:
+        _gh_push_file(token, repo, filename, branch, merged_bytes, sha, commit_msg)
+    except Exception as exc:
+        log_err(f"  Failed to push {filename} to GitHub: {exc}")
+
+
 def _gh_fetch_all_summary_files(
     token: str,
     repo: str,
@@ -1194,6 +1262,13 @@ async def _run(args: argparse.Namespace) -> int:
     stage1_options: list[ServerOption] = []
     stage2_results: list[dict[str, Any]] = []
 
+    # Resolved once, up front, so the finally-block can also use them to
+    # push errorsfaced.txt to GitHub regardless of how the run ends.
+    gh_token  = args.gh_token  or os.environ.get("GH_TOKEN", "")
+    gh_repo   = args.gh_repo   or os.environ.get("GH_REPO",  "")
+    gh_branch = args.gh_branch or os.environ.get("GH_BRANCH", "main")
+    gh_available = not args.no_github_sync and bool(gh_token) and bool(gh_repo)
+
     try:
         if args.skip_stage1:
             log_info("Stage 1 skipped — using existing api_url_list.txt")
@@ -1224,11 +1299,7 @@ async def _run(args: argparse.Namespace) -> int:
                     key = line.split("key=")[-1] if "key=" in line else ""
                     stage1_options.append(ServerOption("", key, line, ""))
 
-            gh_token  = args.gh_token  or os.environ.get("GH_TOKEN", "")
-            gh_repo   = args.gh_repo   or os.environ.get("GH_REPO",  "")
-            gh_branch = args.gh_branch or os.environ.get("GH_BRANCH", "main")
-
-            if not args.no_github_sync and gh_token and gh_repo:
+            if gh_available:
                 github_sync_summary(stage1_options, stage2_results, args.json_out, gh_token, gh_repo, gh_branch)
             else:
                 if not args.no_github_sync and not gh_token:
