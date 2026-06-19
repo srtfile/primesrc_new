@@ -144,6 +144,14 @@ jobs:
             pipeline_summary.gz.json
           if-no-files-found: ignore
 
+      - name: Upload error/warning log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: errors-faced-log
+          path: errorsfaced.txt
+          if-no-files-found: ignore
+
       # ── GitHub sync is handled inside dolkana.py (Stage 3) ──────
       # The script calls the GitHub Contents API directly to push
       # pipeline_summary.json (and -2, -3 … if > 20 MB) to srtfile/movie-data.
