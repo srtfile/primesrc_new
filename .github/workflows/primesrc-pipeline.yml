@@ -21,15 +21,6 @@ on:
           - movie
           - tv
         default: movie
-  schedule:
-    - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - 'dolkana.py'
-      - '.github/workflows/primesrc-pipeline.yml'
-      - 'multiple_primesrc.txt'
 
 jobs:
   extract-urls:
