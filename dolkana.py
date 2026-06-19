@@ -414,9 +414,9 @@ async def _fs_create_session(base_url: str, session_id: str) -> None:
     loop = asyncio.get_running_loop()
     resp = await loop.run_in_executor(
         None,
-        lambda: _fs_post(base_url, {
+        lambda base=base_url, session=session_id: _fs_post(base, {
             "cmd": "sessions.create",
-            "session": session_id,
+            "session": session,
         }),
     )
     if resp.get("status") not in ("ok", "warning"):
@@ -430,9 +430,9 @@ async def _fs_destroy_session(base_url: str, session_id: str) -> None:
     try:
         await loop.run_in_executor(
             None,
-            lambda: _fs_post(base_url, {
+            lambda base=base_url, session=session_id: _fs_post(base, {
                 "cmd": "sessions.destroy",
-                "session": session_id,
+                "session": session,
             }),
         )
         log_info(f"FlareSolverr session destroyed: {session_id}")
@@ -492,11 +492,11 @@ async def _resolve_one_flaresolverr(
             try:
                 fs_resp = await loop.run_in_executor(
                     None,
-                    lambda url=api_url: _fs_post(base_url, {
+                    lambda url=api_url, base=base_url, timeout=timeout_ms, session=session_id: _fs_post(base, {
                         "cmd":        "request.get",
                         "url":        url,
-                        "maxTimeout": timeout_ms,
-                        "session":    session_id,
+                        "maxTimeout": timeout,
+                        "session":    session,
                     }),
                 )
 
