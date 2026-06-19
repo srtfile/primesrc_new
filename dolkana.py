@@ -65,11 +65,14 @@ DEFAULT_API_LIST     = HERE / "api_url_list.txt"
 DEFAULT_STREAM_OUT   = HERE / "final_stream_urls.txt"
 DEFAULT_JSON_SUMMARY = HERE / "pipeline_summary.json"
 DEFAULT_HTML_OUT     = HERE / "pipeline_report.html"
+DEFAULT_ERROR_LOG    = HERE / "errorsfaced.txt"
 
 STAGE1_REQUEST_TIMEOUT = 20   # urllib timeout per /api/v1/s call
-STAGE2_BATCH_SIZE      = 5    # concurrent FlareSolverr requests
-STAGE2_RELOADS         = 2    # retry attempts per failed URL
-STAGE2_FINAL_RETRIES   = 1    # extra full retry passes for still-failed keys
+STAGE2_BATCH_SIZE      = 2    # concurrent FlareSolverr requests (lowered to ease Cloudflare pressure)
+STAGE2_RELOADS         = 3    # retry attempts per failed URL
+STAGE2_FINAL_RETRIES   = 2    # extra full retry passes for still-failed keys
+STAGE2_BATCH_DELAY     = 2.0  # seconds to wait between batches (cool-down for Cloudflare)
+STAGE2_BAN_COOLDOWN    = 20.0 # extra seconds to wait after a batch hits an IP-ban / block error
 
 TMDB_ID_RE = re.compile(r"^\d+$")
 
@@ -104,11 +107,43 @@ def _c(text: str, colour: str) -> str:
     except Exception:
         return text
 
+# ── Error/warning log buffer ──────────────────────────────────────
+# Every WARN/ERR line (including the per-URL "✗ (FS) …" failures raised
+# during Stage 2) gets appended here, then flushed to errorsfaced.txt
+# at the end of the run so a permanent record stays in the local repo.
+_ERROR_LOG_ENTRIES: list[str] = []
+
+def _record_log_entry(level: str, msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    _ERROR_LOG_ENTRIES.append(f"[{ts}] [{level}] {msg}")
+
 def log_info(msg: str) -> None: print(_c(f"[INFO]  {msg}", _CYAN))
 def log_ok(msg: str)   -> None: print(_c(f"[OK]    {msg}", _GREEN))
-def log_warn(msg: str) -> None: print(_c(f"[WARN]  {msg}", _YELLOW))
-def log_err(msg: str)  -> None: print(_c(f"[ERR]   {msg}", _RED))
+def log_warn(msg: str) -> None:
+    print(_c(f"[WARN]  {msg}", _YELLOW))
+    _record_log_entry("WARN", msg)
+def log_err(msg: str)  -> None:
+    print(_c(f"[ERR]   {msg}", _RED))
+    _record_log_entry("ERR", msg)
 def log_head(msg: str) -> None: print(_c(f"\n{'='*60}\n{msg}\n{'='*60}", _BOLD))
+
+def write_error_log(path: Path) -> None:
+    """Append everything collected in _ERROR_LOG_ENTRIES to a local file."""
+    if not _ERROR_LOG_ENTRIES:
+        return
+    try:
+        header = (
+            f"\n{'='*70}\n"
+            f"Pipeline run finished: {datetime.now(timezone.utc).isoformat()}\n"
+            f"Total warnings/errors: {len(_ERROR_LOG_ENTRIES)}\n"
+            f"{'='*70}\n"
+        )
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(header)
+            f.write("\n".join(_ERROR_LOG_ENTRIES) + "\n")
+        log_ok(f"Error/warning log appended → {path}  ({len(_ERROR_LOG_ENTRIES)} entries)")
+    except Exception as exc:
+        print(_c(f"[ERR]   Could not write error log to {path}: {exc}", _RED))
 
 # ═══════════════════════════════════════════════════════════════
 # STAGE 1  –  embed URLs → /api/v1/s → api_url_list.txt
@@ -279,7 +314,7 @@ def stage1_fetch_api_keys(
 # ═══════════════════════════════════════════════════════════════
 
 FLARESOLVERR_DEFAULT_URL = "http://localhost:8191"
-FLARESOLVERR_MAX_TIMEOUT = 30_000  # ms
+FLARESOLVERR_MAX_TIMEOUT = 45_000  # ms (raised from 30s — Cloudflare challenges were timing out)
 
 _print_lock: asyncio.Lock | None = None
 
@@ -433,8 +468,15 @@ async def _resolve_one_flaresolverr(
 
         for attempt in range(reloads + 1):
             if attempt:
-                await safe_print(f"{label} ↻ FlareSolverr retry {attempt}/{reloads}")
-                await asyncio.sleep(1.5)
+                # Exponential backoff (1.5s, 3s, 6s, 12s …), with a longer
+                # forced cool-down whenever Cloudflare is actively blocking
+                # or banning the IP — hammering it again immediately just
+                # burns retries without ever succeeding.
+                delay = 1.5 * (2 ** (attempt - 1))
+                if last_error and re.search(r"banned|blocked", last_error, re.I):
+                    delay = max(delay, 8.0)
+                await safe_print(f"{label} ↻ FlareSolverr retry {attempt}/{reloads} (waiting {delay:.1f}s)")
+                await asyncio.sleep(delay)
 
             # ── Route Everything Directly Through FlareSolverr ──────────────────────
             try:
@@ -454,6 +496,7 @@ async def _resolve_one_flaresolverr(
                         + (f" (HTTP {fs_resp.get('_http_status')})" if "_http_status" in fs_resp else "")
                     )
                     await safe_print(f"{label} ✗ (FS) {last_error}")
+                    _record_log_entry("ERR", f"{label} {api_url} — {last_error}")
                     continue
 
                 data     = _parse_flaresolverr_response(fs_resp)
@@ -484,10 +527,12 @@ async def _resolve_one_flaresolverr(
 
                 last_error = f"no play URL in FS response: {str(data)[:120]}"
                 await safe_print(f"{label} ✗ (FS) {last_error}")
+                _record_log_entry("ERR", f"{label} {api_url} — {last_error}")
 
             except Exception as exc:
                 last_error = str(exc)
                 await safe_print(f"{label} ✗ (FS) {last_error}")
+                _record_log_entry("ERR", f"{label} {api_url} — {last_error}")
 
         return {
             "index":         index,
@@ -549,6 +594,7 @@ async def stage2_extract_stream_urls(
     log_info(f"Reloads per URL     : {args.reloads}")
     log_info(f"Final retry passes  : {args.final_retries}")
     log_info(f"Solver timeout      : {timeout_ms} ms")
+    log_info(f"Batch delay         : {args.batch_delay}s")
 
     log_info("Checking FlareSolverr health…")
     if not _check_flaresolverr_health(base_url):
@@ -570,11 +616,27 @@ async def stage2_extract_stream_urls(
 
         for batch_num, start in enumerate(range(0, len(indexed), args.batch_size), 1):
             batch = indexed[start : start + args.batch_size]
-            results.extend(await _process_batch_fs(
+            batch_results = await _process_batch_fs(
                 base_url, session_id, batch, len(api_urls),
                 timeout_ms, args.reloads, args.batch_size,
                 f"Batch {batch_num}/{batch_total}",
-            ))
+            )
+            results.extend(batch_results)
+
+            # Pace requests between batches so traffic looks less like a
+            # bot hammering the site. If this batch tripped a Cloudflare
+            # block/ban, cool down a lot harder before the next one —
+            # retrying straight into an active ban just burns attempts.
+            if batch_num < batch_total:
+                banned = any(
+                    re.search(r"banned|blocked", r.get("error", "") or "", re.I)
+                    for r in batch_results
+                    if not r.get("extracted_url")
+                )
+                delay = args.batch_delay + (STAGE2_BAN_COOLDOWN if banned else 0)
+                if banned:
+                    log_warn(f"Cloudflare block/ban detected in batch {batch_num} — cooling down {delay:.0f}s")
+                await asyncio.sleep(delay)
 
         for attempt in range(1, args.final_retries + 1):
             failed = [
@@ -585,6 +647,7 @@ async def stage2_extract_stream_urls(
             if not failed:
                 break
             log_info(f"Final retry pass {attempt}/{args.final_retries}: {len(failed)} URL(s)")
+            await asyncio.sleep(args.batch_delay + STAGE2_BAN_COOLDOWN / 2)
             retry_results  = await _process_batch_fs(
                 base_url, session_id, failed, len(api_urls),
                 timeout_ms, 0, args.batch_size,
@@ -1111,8 +1174,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--flaresolverr-url", default=None, dest="flaresolverr_url", help="FlareSolverr URL")
     p.add_argument("--fs-timeout",   type=int, default=FLARESOLVERR_MAX_TIMEOUT, dest="fs_timeout_ms", help="Solver timeout (ms)")
     p.add_argument("--batch-size",   type=int, default=STAGE2_BATCH_SIZE, dest="batch_size", help="Batch process sizing")
+    p.add_argument("--batch-delay",  type=float, default=STAGE2_BATCH_DELAY, dest="batch_delay", help="Seconds to pause between batches")
     p.add_argument("--reloads",      type=int, default=STAGE2_RELOADS, help="Retry attempts per URL")
     p.add_argument("--final-retries", type=int, default=STAGE2_FINAL_RETRIES, dest="final_retries", help="Extra fallback cycles")
+    p.add_argument("--error-log",    type=Path, default=DEFAULT_ERROR_LOG, dest="error_log", help="Local file that accumulates every WARN/ERR line from each run")
     p.add_argument("--no-github-sync", action="store_true", default=False, dest="no_github_sync")
     p.add_argument("--gh-token",   default=None, dest="gh_token")
     p.add_argument("--gh-repo",    default=None, dest="gh_repo")
@@ -1129,51 +1194,56 @@ async def _run(args: argparse.Namespace) -> int:
     stage1_options: list[ServerOption] = []
     stage2_results: list[dict[str, Any]] = []
 
-    if args.skip_stage1:
-        log_info("Stage 1 skipped — using existing api_url_list.txt")
-    else:
-        if not args.input.exists():
-            log_err(f"Input file not found: {args.input}")
-            return 1
-        stage1_options = stage1_fetch_api_keys(args.input, args.api_list, args.type)
-
-    if args.skip_stage2:
-        log_info("Stage 2 skipped.")
-    else:
-        if not args.api_list.exists():
-            log_err(f"API list not found: {args.api_list}")
-            return 1
-        try:
-            stage2_results = await stage2_extract_stream_urls(args.api_list, args.output, args)
-        except ConnectionError:
-            log_err("FlareSolverr unreachable – verification failed.")
-            return 2
-
-    if stage1_options or stage2_results:
-        if not stage1_options and args.api_list.exists():
-            for line in args.api_list.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                key = line.split("key=")[-1] if "key=" in line else ""
-                stage1_options.append(ServerOption("", key, line, ""))
-
-        gh_token  = args.gh_token  or os.environ.get("GH_TOKEN", "")
-        gh_repo   = args.gh_repo   or os.environ.get("GH_REPO",  "")
-        gh_branch = args.gh_branch or os.environ.get("GH_BRANCH", "main")
-
-        if not args.no_github_sync and gh_token and gh_repo:
-            github_sync_summary(stage1_options, stage2_results, args.json_out, gh_token, gh_repo, gh_branch)
+    try:
+        if args.skip_stage1:
+            log_info("Stage 1 skipped — using existing api_url_list.txt")
         else:
-            if not args.no_github_sync and not gh_token:
-                log_warn("GH_TOKEN not set — writing locally only")
-            _write_summary(stage1_options, stage2_results, args.json_out, args.html_out)
+            if not args.input.exists():
+                log_err(f"Input file not found: {args.input}")
+                return 1
+            stage1_options = stage1_fetch_api_keys(args.input, args.api_list, args.type)
 
-    log_head("DONE")
-    if not args.skip_stage2 and stage2_results:
-        ok = sum(1 for r in stage2_results if r.get("extracted_url"))
-        log_ok(f"Stream URLs extracted : {ok} / {len(stage2_results)}")
-    return 0
+        if args.skip_stage2:
+            log_info("Stage 2 skipped.")
+        else:
+            if not args.api_list.exists():
+                log_err(f"API list not found: {args.api_list}")
+                return 1
+            try:
+                stage2_results = await stage2_extract_stream_urls(args.api_list, args.output, args)
+            except ConnectionError:
+                log_err("FlareSolverr unreachable – verification failed.")
+                return 2
+
+        if stage1_options or stage2_results:
+            if not stage1_options and args.api_list.exists():
+                for line in args.api_list.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    key = line.split("key=")[-1] if "key=" in line else ""
+                    stage1_options.append(ServerOption("", key, line, ""))
+
+            gh_token  = args.gh_token  or os.environ.get("GH_TOKEN", "")
+            gh_repo   = args.gh_repo   or os.environ.get("GH_REPO",  "")
+            gh_branch = args.gh_branch or os.environ.get("GH_BRANCH", "main")
+
+            if not args.no_github_sync and gh_token and gh_repo:
+                github_sync_summary(stage1_options, stage2_results, args.json_out, gh_token, gh_repo, gh_branch)
+            else:
+                if not args.no_github_sync and not gh_token:
+                    log_warn("GH_TOKEN not set — writing locally only")
+                _write_summary(stage1_options, stage2_results, args.json_out, args.html_out)
+
+        log_head("DONE")
+        if not args.skip_stage2 and stage2_results:
+            ok = sum(1 for r in stage2_results if r.get("extracted_url"))
+            log_ok(f"Stream URLs extracted : {ok} / {len(stage2_results)}")
+        return 0
+    finally:
+        # Always flush collected warnings/errors to the local repo file,
+        # whether the run finished cleanly, returned early, or raised.
+        write_error_log(args.error_log)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1187,4 +1257,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
