@@ -492,9 +492,9 @@ async def _resolve_one_flaresolverr(
             try:
                 fs_resp = await loop.run_in_executor(
                     None,
-                    lambda: _fs_post(base_url, {
+                    lambda url=api_url: _fs_post(base_url, {
                         "cmd":        "request.get",
-                        "url":        api_url,
+                        "url":        url,
                         "maxTimeout": timeout_ms,
                         "session":    session_id,
                     }),
